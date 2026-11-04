@@ -40,6 +40,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
@@ -72,6 +74,7 @@ import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -96,9 +99,11 @@ import com.gomastery.app.AppViewModel
 import com.gomastery.app.Course
 import com.gomastery.app.DrillItem
 import com.gomastery.app.Leitner
+import com.gomastery.app.Lesson
 import com.gomastery.app.LessonTab
 import com.gomastery.app.Quiz
 import com.gomastery.app.Screen
+import com.gomastery.app.clock
 import kotlinx.coroutines.delay
 
 // ===== Theme.kt =====
@@ -474,6 +479,7 @@ fun HomeScreen(vm: AppViewModel) {
                     Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
+                    GhostButton("Glossary") { vm.open(Screen.Glossary) }
                     GhostButton("Review") { vm.open(Screen.Review) }
                     GhostButton("Drill") { vm.open(Screen.Drill) }
                     GhostButton("Report") { vm.open(Screen.Report) }
@@ -569,8 +575,9 @@ fun LessonScreen(vm: AppViewModel) {
         else showMovie = true
     }
     fun openVideo() {
-        openUrl(ctx, l.video ?: youtubeFor(l.title))
-        vm.status = "Opened a short-video search in your browser."
+        val v = l.videos.firstOrNull()
+        openUrl(ctx, v?.url ?: l.video ?: youtubeFor(l.title))
+        vm.status = if (v != null) "Opened: ${v.title}" else "Opened a short-video search in your browser."
     }
 
     Column(
@@ -608,12 +615,14 @@ fun LessonScreen(vm: AppViewModel) {
                 )
                 Text(vm.course.modules[l.module], color = C.MUTED, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
+            TextButton(onClick = { showLookup = true }) { Text("🔍", fontSize = 18.sp) }
             Box {
                 TextButton(onClick = { menu = true }) { Text("⋮", color = C.FG, fontSize = 20.sp) }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("▶ Micro-movie  (F7)") }, onClick = { menu = false; playMovie() })
-                    DropdownMenuItem(text = { Text("Short video  (F8)") }, onClick = { menu = false; openVideo() })
-                    DropdownMenuItem(text = { Text("Look up a word  (Ctrl+B)") }, onClick = { menu = false; showLookup = true })
+                    DropdownMenuItem(text = { Text("▶ Watch the first video  (F8)") }, onClick = { menu = false; openVideo() })
+                    DropdownMenuItem(text = { Text("🔍 Look up a word") }, onClick = { menu = false; showLookup = true })
+                    DropdownMenuItem(text = { Text("📖 Glossary (every technical word)") }, onClick = { menu = false; vm.open(Screen.Glossary) })
                     DropdownMenuItem(text = { Text("Memory diagrams") }, onClick = { menu = false; vm.open(Screen.Diagrams) })
                     DropdownMenuItem(text = { Text("Review deck") }, onClick = { menu = false; vm.open(Screen.Review) })
                     DropdownMenuItem(text = { Text("All lessons") }, onClick = { menu = false; vm.open(Screen.Home) })
@@ -703,7 +712,12 @@ fun MovieDialog(title: String, frames: List<String>, onDismiss: () -> Unit) {
 @Composable
 fun LookupDialog(vm: AppViewModel, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
-    var word by remember { mutableStateOf("") }
+    val clip = LocalClipboardManager.current
+    // Like the desktop app pre-fills the selected word: use a short copied word.
+    var word by remember {
+        val c = try { clip.getText()?.text?.trim() ?: "" } catch (e: Exception) { "" }
+        mutableStateOf(if (c.isNotEmpty() && c.length <= 40 && '\n' !in c) c else "")
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = C.PANEL,
@@ -716,7 +730,15 @@ fun LookupDialog(vm: AppViewModel, onDismiss: () -> Unit) {
                     value = word, onValueChange = { word = it }, singleLine = true,
                     textStyle = codeStyle, colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
                 )
-                Text("Opens a search in your browser · keyboard shortcut: Ctrl+B", color = C.MUTED, fontSize = 11.sp)
+                val hits = remember(word) {
+                    val w = word.trim().lowercase()
+                    if (w.length < 2) emptyList() else vm.course.glossary.filter { it.term.lowercase().contains(w) }.take(4)
+                }
+                hits.forEach { g ->
+                    Text("${g.term}: ${g.def}", color = C.FG, fontSize = 13.sp, modifier = Modifier.padding(top = 6.dp))
+                }
+                if (word.isNotBlank() && hits.isEmpty()) Text("Not in the course glossary; Search opens your browser.", color = C.MUTED, fontSize = 11.sp)
+                Text("Tip: long-press a word in the lesson, tap Copy, then tap 🔍 and it is filled in.", color = C.MUTED, fontSize = 11.sp)
             }
         },
         confirmButton = {
@@ -770,7 +792,20 @@ fun LessonTabContent(vm: AppViewModel) {
             TextButton(onClick = { vm.bumpFont(1) }) { Text("A+", color = C.MUTED) }
             TextButton(onClick = { vm.resetFont() }) { Text("Reset", color = C.MUTED, fontSize = 12.sp) }
         }
-        ConceptText(concept, vm.fontSize)
+        ExplainToggle(vm.eli5Mode) { vm.setEli5(it) }
+        if (vm.eli5Mode) {
+            if (l.eli5.isNotBlank()) {
+                ConceptText("▸  EXPLAIN LIKE I'M 5\n" + l.eli5, vm.fontSize + 1)
+                Spacer(Modifier.height(6.dp))
+                Text("Tap \"Explain it to me\" above for the full explanation.", color = C.MUTED, fontSize = 11.sp)
+            } else {
+                Text("The simple version isn't written for this lesson yet, so here is the normal one.", color = C.ACCENT2, fontSize = 12.sp)
+                ConceptText(concept, vm.fontSize)
+            }
+        } else {
+            ConceptText(concept, vm.fontSize)
+        }
+        VideosSection(l)
 
         if (l.hasEditor) {
             Spacer(Modifier.height(4.dp))
@@ -1088,6 +1123,71 @@ fun CheckTab(vm: AppViewModel) {
                         "go test -race ./... && staticcheck ./...",
                     color = C.MUTED, fontSize = 11.sp,
                 )
+            }
+        }
+    }
+}
+
+/** Hand-picked videos; for long courses only the minutes that teach this lesson. */
+@Composable
+fun VideosSection(l: Lesson) {
+    val ctx = LocalContext.current
+    Spacer(Modifier.height(4.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        SectionLabel("▶ VIDEOS")
+        Spacer(Modifier.width(8.dp))
+        Text(
+            if (l.videos.isEmpty()) "none hand-picked for this lesson yet"
+            else "tap one to watch it in YouTube",
+            color = C.MUTED, fontSize = 11.sp,
+        )
+    }
+    l.videos.forEach { v ->
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp)
+                .background(C.PANEL, RoundedCornerShape(8.dp))
+                .border(1.dp, C.LINE, RoundedCornerShape(8.dp))
+                .clickable { openUrl(ctx, v.url) }
+                .padding(10.dp)
+        ) {
+            Text("▶  " + v.title, color = C.FG, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(2.dp))
+            val span = when {
+                v.whole && v.end > 0 -> "whole video · ${clock(v.end)}"
+                v.whole -> "whole video"
+                else -> "watch ${clock(v.start)} → ${clock(v.end)}  (${v.minutes} min)"
+            }
+            Text(v.channel + "   ·   " + span, color = C.ACCENT, fontSize = 12.sp)
+        }
+    }
+    if (l.videos.isEmpty()) {
+        GhostButton("Search YouTube for this lesson") { openUrl(ctx, l.video ?: youtubeFor(l.title)) }
+    }
+}
+
+/** "Explain it to me" / "Explain like I'm 5" switch above the explanation. */
+@Composable
+fun ExplainToggle(eli5: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(C.PANEL, RoundedCornerShape(10.dp))
+            .border(1.dp, C.LINE, RoundedCornerShape(10.dp))
+            .padding(3.dp)
+    ) {
+        listOf(false to "Explain it to me", true to "Explain like I'm 5").forEach { (mode, label) ->
+            val on = mode == eli5
+            Box(
+                Modifier
+                    .weight(1f)
+                    .background(if (on) C.SELBG else C.PANEL, RoundedCornerShape(8.dp))
+                    .clickable { onChange(mode) }
+                    .padding(vertical = 9.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(label, color = if (on) C.ACCENT else C.MUTED, fontSize = 13.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
             }
         }
     }
@@ -1616,6 +1716,7 @@ fun StatsScreen(vm: AppViewModel) {
         val (learning, mid, known) = vm.leitner.summary()
         Text("Review cards — learning: $learning  ·  review: $mid  ·  well-known: $known", color = C.FG, fontSize = 14.sp)
         Text("Drill sessions run: ${vm.drill.sessions}", color = C.FG, fontSize = 14.sp)
+        ResetProgressSection(vm)
         SectionLabel("BY MODULE")
         vm.course.modules.forEachIndexed { m, name ->
             val ls = vm.course.lessons.filter { it.module == m }
@@ -1681,5 +1782,122 @@ fun AboutScreen(vm: AppViewModel) {
                 "Ctrl+= / Ctrl+-  bigger / smaller text\nCtrl+0         reset text size\nCtrl+B         look up a word\n" +
                 "F7             micro-movie\nF8             short video",
         )
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════ Reset progress
+@Composable
+fun ResetProgressSection(vm: AppViewModel) {
+    var lessons by remember { mutableStateOf(true) }
+    var rewards by remember { mutableStateOf(true) }
+    var review by remember { mutableStateOf(true) }
+    var drillToo by remember { mutableStateOf(true) }
+    var notesToo by remember { mutableStateOf(false) }
+    var confirm by remember { mutableStateOf(false) }
+    var done by remember { mutableStateOf(false) }
+
+    Spacer(Modifier.height(8.dp))
+    SectionLabel("RESET PROGRESS", color = C.ERR)
+    Panel(border = C.ERR) {
+        Column {
+            Text("Choose what to erase. This can't be undone.", color = C.FG, fontSize = 13.sp)
+            ResetOption("Completed lessons (all ✓ marks)", lessons) { lessons = it }
+            ResetOption("XP, rank, streak, gems and daily goal history", rewards) { rewards = it }
+            ResetOption("Review deck (spaced-repetition boxes)", review) { review = it }
+            ResetOption("Drill schedule and session count", drillToo) { drillToo = it }
+            ResetOption("My notes (\"Explain it back\" text)", notesToo) { notesToo = it }
+            Spacer(Modifier.height(6.dp))
+            AccentButton(
+                "Reset selected…", color = C.ERR,
+                enabled = lessons || rewards || review || drillToo || notesToo,
+            ) { confirm = true }
+            if (done) Text("Done. Selected progress was erased.", color = C.OK, fontSize = 12.sp)
+        }
+    }
+
+    if (confirm) {
+        AlertDialog(
+            onDismissRequest = { confirm = false },
+            containerColor = C.PANEL,
+            title = { Text("Erase this progress?", color = C.FG) },
+            text = {
+                Text(
+                    listOfNotNull(
+                        if (lessons) "• completed lessons" else null,
+                        if (rewards) "• XP, rank and streak" else null,
+                        if (review) "• review deck" else null,
+                        if (drillToo) "• drill schedule" else null,
+                        if (notesToo) "• your notes" else null,
+                    ).joinToString("\n") + "\n\nThis can't be undone.",
+                    color = C.FG,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.resetProgress(lessons, rewards, review, drillToo, notesToo)
+                    confirm = false
+                    done = true
+                }) { Text("Erase", color = C.ERR) }
+            },
+            dismissButton = { TextButton(onClick = { confirm = false }) { Text("Keep") } },
+        )
+    }
+}
+
+@Composable
+private fun ResetOption(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable { onChange(!checked) },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(
+            checked = checked, onCheckedChange = onChange,
+            colors = CheckboxDefaults.colors(checkedColor = C.ERR, uncheckedColor = C.MUTED),
+        )
+        Text(label, color = C.FG, fontSize = 14.sp)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════ Glossary
+@Composable
+fun GlossaryScreen(vm: AppViewModel) {
+    val all = vm.course.glossary
+    val q = vm.glossarySearch.trim().lowercase()
+    val shown = remember(q) {
+        if (q.isEmpty()) all else all.filter { it.term.lowercase().contains(q) || it.def.lowercase().contains(q) }
+    }
+    Page(vm, "Glossary · ${all.size} words") {
+        Text("Every technical word used in the course, explained for a complete beginner.", color = C.MUTED, fontSize = 12.sp)
+        OutlinedTextField(
+            value = vm.glossarySearch, onValueChange = { vm.glossarySearch = it },
+            placeholder = { Text("Search words…", color = C.MUTED) }, singleLine = true,
+            colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+        )
+        Text("${shown.size} shown", color = C.MUTED, fontSize = 11.sp)
+        shown.forEach { g ->
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 3.dp)
+                    .background(C.PANEL, RoundedCornerShape(8.dp))
+                    .border(1.dp, C.LINE, RoundedCornerShape(8.dp))
+                    .padding(10.dp)
+            ) {
+                Text(g.term, color = C.ACCENT, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(g.def, color = C.FG, fontSize = 14.sp)
+                val lessons = vm.course.lessons
+                if (g.taught in lessons.indices) {
+                    Text(
+                        "Lesson about it: ${lessons[g.taught].title}", color = C.OK, fontSize = 12.sp,
+                        modifier = Modifier.clickable { vm.openLesson(g.taught) }.padding(top = 4.dp),
+                    )
+                } else if (g.first in lessons.indices) {
+                    Text(
+                        "First used in: ${lessons[g.first].title}", color = C.MUTED, fontSize = 12.sp,
+                        modifier = Modifier.clickable { vm.openLesson(g.first) }.padding(top = 4.dp),
+                    )
+                }
+            }
+        }
     }
 }

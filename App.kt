@@ -38,6 +38,7 @@ import com.gomastery.app.ui.AboutScreen
 import com.gomastery.app.ui.C
 import com.gomastery.app.ui.DiagramsScreen
 import com.gomastery.app.ui.DrillScreen
+import com.gomastery.app.ui.GlossaryScreen
 import com.gomastery.app.ui.GoTheme
 import com.gomastery.app.ui.HomeScreen
 import com.gomastery.app.ui.LessonScreen
@@ -75,6 +76,18 @@ data class Quiz(
     val hint: String?,
 )
 
+/** A hand-picked video, or the exact part of a long video, that explains a lesson. */
+data class VideoRef(
+    val id: String, val channel: String, val title: String,
+    val start: Int, val end: Int, val whole: Boolean,
+) {
+    val url: String get() = "https://www.youtube.com/watch?v=$id" + (if (start > 0) "&t=${start}s" else "")
+    val minutes: Int get() = maxOf(1, (end - start + 30) / 60)
+}
+
+fun clock(s: Int): String =
+    if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
+
 data class Lesson(
     val index: Int,
     val module: Int,
@@ -95,6 +108,13 @@ data class Lesson(
     val boss: Boolean,
     val isBranch: Boolean,
     val depth: Int,
+    val videos: List<VideoRef>,
+    /** "Explain like I'm five" version of the concept (empty when not written yet). */
+    val eli5: String,
+    /** Things this lesson's code uses before their own lesson, each explained in one line. */
+    val newHere: String,
+    /** Technical words that appear for the first time in this lesson and are explained here. */
+    val words: List<String>,
 ) {
     val hasCode: Boolean get() = code.isNotBlank()
     /** A write-it-yourself challenge (demos ship working code to just run). */
@@ -103,6 +123,9 @@ data class Lesson(
     val hasEditor: Boolean get() = hasCode
     val isTest: Boolean get() = "test" in flags
 }
+
+/** A plain-language explanation of a technical word. first/taught are lesson indexes (-1 = none). */
+data class GlossaryEntry(val term: String, val def: String, val first: Int, val taught: Int)
 
 data class DiagramRow(
     val name: String, val addr: String, val size: String,
@@ -158,7 +181,9 @@ class Course(
     val lintRules: List<LintRule>,
     val drillItems: List<DrillItem>,
     val ui: UiTables,
+    val glossary: List<GlossaryEntry>,
 ) {
+    val glossaryByTerm: Map<String, GlossaryEntry> = glossary.associateBy { it.term }
     private val byTitle: Map<String, Lesson> = lessons.associateBy { it.title }
     fun lesson(title: String?): Lesson? = title?.let { byTitle[it] }
     fun diagram(key: String?): Diagram? = diagrams.firstOrNull { it.key == key }
@@ -227,6 +252,18 @@ class Course(
                     boss = o.optBoolean("boss", false),
                     isBranch = o.optBoolean("is_branch", false),
                     depth = o.optInt("branch_depth", 0),
+                    videos = o.optJSONArray("videos")?.let { va ->
+                        List(va.length()) { k ->
+                            val v = va.getJSONObject(k)
+                            VideoRef(
+                                v.getString("id"), v.optString("channel", ""), v.optString("title", ""),
+                                v.optInt("start", 0), v.optInt("end", 0), v.optBoolean("whole", false),
+                            )
+                        }
+                    } ?: emptyList(),
+                    eli5 = o.optString("eli5", ""),
+                    newHere = o.optString("newhere", ""),
+                    words = o.optJSONArray("words").strings(),
                 )
             }
             val da = root.getJSONArray("diagrams")
@@ -282,7 +319,12 @@ class Course(
                 selfExplain = u.getJSONArray("selfExplain").strings(),
                 easyPrefixes = u.getJSONArray("easyPrefixes").strings(),
             )
-            return Course(modules, lessons, diagrams, subgoals, lintRules, items, ui)
+            val ga = root.optJSONArray("glossary")
+            val glossary = if (ga == null) emptyList() else List(ga.length()) { i ->
+                val g = ga.getJSONObject(i)
+                GlossaryEntry(g.getString("term"), g.getString("def"), g.optInt("first", -1), g.optInt("taught", -1))
+            }.sortedBy { it.term.lowercase() }
+            return Course(modules, lessons, diagrams, subgoals, lintRules, items, ui, glossary)
         }
     }
 }
@@ -305,6 +347,7 @@ class Store(ctx: Context) {
 
     fun int(key: String, def: Int) = p.getInt(key, def)
     fun saveInt(key: String, v: Int) = p.edit().putInt(key, v).apply()
+    fun remove(vararg keys: String) = p.edit().apply { keys.forEach { remove(it) } }.apply()
     fun bool(key: String, def: Boolean) = p.getBoolean(key, def)
     fun saveBool(key: String, v: Boolean) = p.edit().putBoolean(key, v).apply()
 }
@@ -846,8 +889,15 @@ class Teaching(private val course: Course) {
         } else {
             parts += l.concept
         }
+        if (l.newHere.isNotBlank()) parts += "▸  NEW IN THIS CODE (explained here so nothing is unseen)\n${l.newHere}"
         val walk = walkthrough(l.code)
         if (walk.isNotEmpty()) parts += "▸  LINE BY LINE\n$walk"
+        val words = l.words.mapNotNull { course.glossaryByTerm[it] }
+        if (words.isNotEmpty()) {
+            parts += "▸  WORDS USED HERE (first time in the course)\n" +
+                words.joinToString("\n") { "  • ${it.term} - ${it.def}" } +
+                "\n  (All ${course.glossary.size} words: Glossary, from the ⋮ menu or the home screen.)"
+        }
         return parts.joinToString("\n\n")
     }
 
@@ -1226,6 +1276,7 @@ sealed class Screen {
     data object Stats : Screen()
     data object Playground : Screen()
     data object About : Screen()
+    data object Glossary : Screen()
 }
 
 enum class LessonTab { Lesson, Quiz, Parsons, Check }
@@ -1234,10 +1285,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val course: Course = Course.load(app)
     val teaching = Teaching(course)
     val store = Store(app)
-    val engage = Engage(store, course.ui.ranks)
+    var engage = Engage(store, course.ui.ranks)
+        private set
     val go = GoToolchain(app, course.ui.errorHints)
-    val drill = DrillScheduler(store, course.drillItems)
-    val leitner = Leitner(store)
+    var drill = DrillScheduler(store, course.drillItems)
+        private set
+    var leitner = Leitner(store)
+        private set
 
     // ---------------------------------------------------------- navigation
     var screen by mutableStateOf<Screen>(Screen.Home)
@@ -1332,6 +1386,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Erase the chosen kinds of progress. Nothing else (settings, the Go install) is touched. */
+    fun resetProgress(lessons: Boolean, rewards: Boolean, review: Boolean, drillToo: Boolean, notesToo: Boolean) {
+        if (lessons) {
+            store.remove("completed", "last_lesson")
+            completed = emptySet()
+            lastLessonIndex = 0
+        }
+        if (rewards) {
+            store.remove("engage")
+            engage = Engage(store, course.ui.ranks)
+        }
+        if (review) {
+            store.remove("review")
+            leitner = Leitner(store)
+        }
+        if (drillToo) {
+            store.remove("drill")
+            drill = DrillScheduler(store, course.drillItems)
+        }
+        if (notesToo) {
+            store.remove("notes")
+            notes = store.obj("notes")
+            note = ""
+        }
+        engageSummary = engage.summary()
+        status = "Progress reset."
+    }
+
     fun setGoal(n: Int) {
         engage.setGoal(n)
         engageSummary = engage.summary()
@@ -1358,8 +1440,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var lastLessonIndex by mutableStateOf(store.int("last_lesson", 0))
         private set
+    /** false = "Explain it to me" (normal), true = "Explain like I'm 5". */
+    var eli5Mode by mutableStateOf(store.bool("eli5_mode", false))
+        private set
 
-    private val notes = store.obj("notes")
+    fun setEli5(on: Boolean) {
+        eli5Mode = on
+        store.saveBool("eli5_mode", on)
+    }
+
+    private var notes = store.obj("notes")
 
     fun openLesson(i: Int) {
         loadLesson(i, push = true)
@@ -1541,6 +1631,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ list UI
     var search by mutableStateOf("")
+    var glossarySearch by mutableStateOf("")
     var collapsed by mutableStateOf<Set<String>>(emptySet())
 
     fun toggleCollapse(title: String) {
@@ -1617,6 +1708,7 @@ fun AppRoot(vm: AppViewModel) {
             is Screen.Stats -> StatsScreen(vm)
             is Screen.Playground -> PlaygroundScreen(vm)
             is Screen.About -> AboutScreen(vm)
+            is Screen.Glossary -> GlossaryScreen(vm)
         }
         val lines = vm.snack
         if (lines != null) {
